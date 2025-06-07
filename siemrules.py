@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import ipaddress
 
 def warning(message):
@@ -283,124 +284,303 @@ def check_internal_server_behavior(anomalous_data, server_baseline):
     
     info(f"Total server behavior alerts generated: {alerts}" if alerts > 0 else "No internal server anomalies detected")
 
-def check_client_behavior_anomalies(normal_data, anomalous_data, client_baseline):
+class CompromisedClientsReport:
+    def __init__(self, clients_data):
+        self.clients_data = clients_data  # Dict: {ip: {'violations': [...], 'details': {...}}}
+    
+    def filterBy(self, *filters):
+        """Filter clients by violation types or specific IPs"""
+        filtered_clients = {}
+        
+        # Parse filters
+        violation_filters = []
+        ip_filters = []
+        
+        for f in filters:
+            if isinstance(f, str):
+                violation_filters.append(f)
+            elif hasattr(f, '__iter__'):  # For client_ip() results
+                ip_filters.extend(f)
+        
+        for client_ip, data in self.clients_data.items():
+            # Check IP filters first
+            if ip_filters and client_ip not in ip_filters:
+                continue
+            
+            # Check violation filters
+            if violation_filters:
+                client_violations = ' '.join(data['violations'])
+                if all(self._check_violation_filter(vf, client_violations) for vf in violation_filters):
+                    filtered_clients[client_ip] = data
+            else:
+                filtered_clients[client_ip] = data
+        
+        return CompromisedClientsReport(filtered_clients)
+    
+    def _check_violation_filter(self, filter_name, violations_text):
+        """Check if a violation filter matches"""
+        filter_mappings = {
+            'protocol_violations': 'protocols',
+            'country_violations': 'countries', 
+            'asn_violations': 'ASNs',
+            'traffic_violations': ['Flow', 'Upload', 'Download'],
+            'flow_frequency_violation': 'frequency',
+            'internal_ip_violations': 'internal IPs'
+        }
+        
+        if filter_name in filter_mappings:
+            keywords = filter_mappings[filter_name]
+            if isinstance(keywords, list):
+                return any(keyword in violations_text for keyword in keywords)
+            else:
+                return keywords in violations_text
+        return False
+    
+    def client_ip(self, *ips):
+        """Helper function to specify client IPs"""
+        return list(ips)
+    
+    def show(self, detailed=True):
+        """Display the filtered results"""
+        if not self.clients_data:
+            print("No compromised clients found with the specified filters.")
+            return
+        
+        print(f"Filtered Results: {len(self.clients_data)} clients")
+        print("=" * 50)
+        
+        for client_ip, data in self.clients_data.items():
+            print(f"\nClient: {client_ip}")
+            if detailed and 'details' in data:
+                details = data['details']
+                print(f"  Flow Change: {details.get('flow_change', 'N/A')}")
+                print(f"  Upload Change: {details.get('upload_change', 'N/A')}")
+                print(f"  Download Change: {details.get('download_change', 'N/A')}")
+                print(f"  Frequency Change: {details.get('frequency_change', 'N/A')}")
+            
+            print(f"  Violations ({len(data['violations'])}):")
+            for violation in data['violations']:
+                print(f"    • {violation}")
+    
+    def summary(self):
+        """Show summary statistics"""
+        if not self.clients_data:
+            print("No clients in current filter.")
+            return
+        
+        total = len(self.clients_data)
+        violation_counts = {
+            'Protocol': 0, 'Geographic': 0, 'Infrastructure': 0, 
+            'Traffic': 0, 'Internal Network': 0
+        }
+        
+        for data in self.clients_data.values():
+            violations_text = ' '.join(data['violations'])
+            if 'protocols' in violations_text:
+                violation_counts['Protocol'] += 1
+            if 'countries' in violations_text:
+                violation_counts['Geographic'] += 1
+            if 'ASNs' in violations_text:
+                violation_counts['Infrastructure'] += 1
+            if any(t in violations_text for t in ['Flow', 'Upload', 'Download', 'frequency']):
+                violation_counts['Traffic'] += 1
+            if 'internal IPs' in violations_text:
+                violation_counts['Internal Network'] += 1
+        
+        print(f"Summary for {total} filtered clients:")
+        print(f"  Detected Clients IPs: {', '.join(self.clients_data.keys())}")
+        for vtype, count in violation_counts.items():
+            print(f"  {vtype} violations: {count} clients ({count/total*100:.1f}%)")
+    
+    def __len__(self):
+        return len(self.clients_data)
+    
+    def __iter__(self):
+        return iter(self.clients_data.items())
+    
+def check_client_behavior_anomalies(normal_data, anomalous_data, client_baseline, server_baseline):
     alerts = 0
     compromised_clients = {}
     info("Running SIEM Rule: Client Behavior Anomaly Detection")
     
-    # Convert timestamp to minutes for anomalous data
-    anomalous_data_with_minutes = anomalous_data.copy()
-    anomalous_data_with_minutes['minute'] = anomalous_data_with_minutes['timestamp'] // 6000
-    
+    # Pre-compute global sets
     normal_countries = set(normal_data['dst_cc'].unique())
     normal_asns = set(normal_data['dst_asn'].dropna().unique())
+    server_ips = list(server_baseline.keys())
     
-    # Get client flows (exclude server IPs)
-    server_ips = ['192.168.108.234', '192.168.108.240', '192.168.108.233', '192.168.108.231', '192.168.108.237']
-    client_flows = anomalous_data_with_minutes[~anomalous_data_with_minutes['src_ip'].isin(server_ips)]
+    # Process client flows in bulk
+    client_flows = anomalous_data[~anomalous_data['src_ip'].isin(server_ips)].copy()
+    client_flows['minute'] = client_flows['timestamp'] // 6000
+    client_flows['proto_port'] = client_flows['proto'] + ':' + client_flows['port'].astype(str)
+    client_flows['is_private'] = client_flows['dst_ip'].apply(lambda x: ipaddress.ip_address(x).is_private)
     
-    # Process each client in the anomalous data
-    for src_ip in client_flows['src_ip'].unique():
-        client_data = client_flows[client_flows['src_ip'] == src_ip]
-        violations = []
-        
-        # Find baseline for this client
-        baseline_row = client_baseline[client_baseline['src_ip'] == src_ip]
-        if baseline_row.empty:
+    # Aggregate current client data
+    current_stats = client_flows.groupby('src_ip').agg({
+        'proto_port': lambda x: set(x),
+        'dst_cc': lambda x: set([cc for cc in x.dropna() if cc is not None]),
+        'dst_asn': lambda x: set([int(asn) for asn in x.dropna()]),
+        'dst_ip': lambda x: set(x[client_flows.loc[x.index, 'is_private']]),
+        'src_ip': 'count',
+        'up_bytes': 'sum',
+        'down_bytes': 'sum',
+        'minute': 'nunique'
+    }).rename(columns={'src_ip': 'flows', 'minute': 'active_minutes'})
+    
+    # Convert baseline to dict for faster lookup
+    baseline_dict = {row['src_ip']: row for _, row in client_baseline.iterrows()}
+    
+    # Check each client
+    for src_ip, stats in current_stats.iterrows():
+        if src_ip not in baseline_dict:
             critical(f"Unknown client detected: {src_ip} (not in baseline)")
             alerts += 1
             continue
-            
-        baseline = baseline_row.iloc[0]
         
-        # Check protocol:port violations
-        current_protocols = set((client_data['proto'] + ':' + client_data['port'].astype(str)).unique())
-        baseline_protocols = set(baseline['protocol_ports'])
-        new_protocols = current_protocols - baseline_protocols
+        baseline = baseline_dict[src_ip]
+        violations = []
+        details = {}
+        
+        # Protocol violations
+        new_protocols = stats['proto_port'] - set(baseline['protocol_ports'])
         if new_protocols:
             violations.append(f"New protocols: {', '.join(new_protocols)}")
         
-        # Check contacted countries violations
-        if 'dst_cc' in client_data.columns:
-            current_countries = set([cc for cc in client_data['dst_cc'].unique() if cc is not None])
-            baseline_countries = set(baseline['contacted_countries'])
-            new_countries = current_countries - baseline_countries
-            if new_countries and not new_countries.issubset(normal_countries):
-                violations.append(f"New countries: {', '.join(new_countries)}")
+        # Country violations
+        new_countries = stats['dst_cc'] - set(baseline['contacted_countries'])
+        if new_countries and not new_countries.issubset(normal_countries):
+            violations.append(f"New countries: {', '.join(new_countries)}")
         
-        # Check contacted ASNs violations
-        if 'dst_asn' in client_data.columns:
-            current_asns = set([int(asn) for asn in client_data['dst_asn'].dropna().unique()])
-            baseline_asns = set(baseline['contacted_asns'])
-            new_asns = current_asns - baseline_asns
-            if new_asns and not new_asns.issubset(normal_asns):
-                violations.append(f"New ASNs: {', '.join([f'AS{asn}' for asn in sorted(new_asns)])}")
+        # ASN violations
+        new_asns = stats['dst_asn'] - set(baseline['contacted_asns'])
+        if new_asns and not new_asns.issubset(normal_asns):
+            violations.append(f"New ASNs: {', '.join([f'AS{asn}' for asn in sorted(new_asns)])}")
         
-        # Check private IP violations
-        current_private_ips = set(client_data[client_data['dst_ip'].apply(lambda x: ipaddress.ip_address(x).is_private)]['dst_ip'].unique())
-        baseline_private_ips = set(baseline['contacted_private_ip'])
-        new_private_ips = current_private_ips - baseline_private_ips
+        # Private IP violations
+        new_private_ips = stats['dst_ip'] - set(baseline['contacted_private_ip'])
         if new_private_ips:
             violations.append(f"New internal IPs: {', '.join(sorted(new_private_ips))}")
         
-        # Check traffic volume anomalies
-        current_flows = len(client_data)
-        baseline_flows = baseline['tot_flows']
-        flow_change = ((current_flows - baseline_flows) / baseline_flows) * 100
+        # Traffic anomalies
+        flows_per_min = stats['flows'] / stats['active_minutes'] if stats['active_minutes'] > 0 else 0
+        changes = {
+            'flow_change': ((stats['flows'] - baseline['tot_flows']) / baseline['tot_flows']) * 100,
+            'upload_change': ((stats['up_bytes'] - baseline['tot_up_traffic']) / baseline['tot_up_traffic']) * 100 if baseline['tot_up_traffic'] > 0 else 0,
+            'download_change': ((stats['down_bytes'] - baseline['tot_down_traffic']) / baseline['tot_down_traffic']) * 100 if baseline['tot_down_traffic'] > 0 else 0,
+            'frequency_change': ((flows_per_min - baseline['avg_flows_per_minute']) / baseline['avg_flows_per_minute']) * 100 if baseline['avg_flows_per_minute'] > 0 else 0
+        }
         
-        current_up = client_data['up_bytes'].sum()
-        baseline_up = baseline['tot_up_traffic']
-        up_change = ((current_up - baseline_up) / baseline_up) * 100 if baseline_up > 0 else 0
+        details.update(changes)
         
-        current_down = client_data['down_bytes'].sum()
-        baseline_down = baseline['tot_down_traffic']
-        down_change = ((current_down - baseline_down) / baseline_down) * 100 if baseline_down > 0 else 0
+        thresholds = {'flow_change': 100, 'upload_change': 200, 'download_change': 200, 'frequency_change': 100}
+        for metric, change in changes.items():
+            if abs(change) >= thresholds[metric]:
+                if metric == 'flow_change':
+                    violations.append(f"Flow count: {change:+.1f}% ({baseline['tot_flows']} -> {stats['flows']})")
+                elif 'upload' in metric:
+                    violations.append(f"Upload traffic: {change:+.1f}% ({baseline['tot_up_traffic']:,} -> {stats['up_bytes']:,} bytes)")
+                elif 'download' in metric:
+                    violations.append(f"Download traffic: {change:+.1f}% ({baseline['tot_down_traffic']:,} -> {stats['down_bytes']:,} bytes)")
+                elif 'frequency' in metric:
+                    violations.append(f"Flow frequency: {change:+.1f}% ({baseline['avg_flows_per_minute']:.2f} -> {flows_per_min:.2f} flows/min)")
         
-        # Check flows per minute
-        active_minutes = client_data['minute'].nunique()
-        current_flows_per_min = current_flows / active_minutes if active_minutes > 0 else 0
-        baseline_flows_per_min = baseline['avg_flows_per_minute']
-        flows_per_min_change = ((current_flows_per_min - baseline_flows_per_min) / baseline_flows_per_min) * 100 if baseline_flows_per_min > 0 else 0
-        
-        # Add traffic anomalies to violations
-        if abs(flow_change) >= 100:
-            violations.append(f"Flow count: {flow_change:+.1f}% ({baseline_flows} -> {current_flows})")
-        if abs(up_change) >= 200:
-            violations.append(f"Upload traffic: {up_change:+.1f}% ({baseline_up:,} -> {current_up:,} bytes)")
-        if abs(down_change) >= 200:
-            violations.append(f"Download traffic: {down_change:+.1f}% ({baseline_down:,} -> {current_down:,} bytes)")
-        if abs(flows_per_min_change) >= 100:
-            violations.append(f"Flow frequency: {flows_per_min_change:+.1f}% ({baseline_flows_per_min:.2f} -> {current_flows_per_min:.2f} flows/min)")
-        
-        # Report violations for this client
         if violations:
-            compromised_clients[src_ip] = violations
-            violation_summary = "; ".join(violations)
-            critical(f"Compromised client {src_ip}: {violation_summary}")
+            compromised_clients[src_ip] = {
+                'violations': violations,
+                'details': details
+            }
+            critical(f"Compromised client {src_ip}: {'; '.join(violations)}")
             alerts += 1
     
-    # Generate summary report
+    # Summary report
     if compromised_clients:
-        info(f"Compromised Client Summary Report:")
-        info(f"  Total compromised clients: {len(compromised_clients)}")
-        
-        # Categorize violations
-        protocol_violations = sum(1 for v in compromised_clients.values() if any('protocol' in violation for violation in v))
-        country_violations = sum(1 for v in compromised_clients.values() if any('countries' in violation for violation in v))
-        asn_violations = sum(1 for v in compromised_clients.values() if any('ASNs' in violation for violation in v))
-        traffic_violations = sum(1 for v in compromised_clients.values() if any(any(t in violation for t in ['Flow', 'Upload', 'Download', 'frequency']) for violation in v))
-        
-        info(f"  Protocol violations: {protocol_violations} clients")
-        info(f"  Geographic violations: {country_violations} clients")
-        info(f"  Infrastructure violations: {asn_violations} clients")
-        info(f"  Traffic anomalies: {traffic_violations} clients")
-        
-        # List most severely compromised clients (multiple violation types)
-        severe_clients = [ip for ip, violations in compromised_clients.items() if len(violations) >= 3]
-        if severe_clients:
-            info(f"  Severely compromised (≥3 violations): {len(severe_clients)} clients")
-            for ip in severe_clients[:5]:  # Show top 5
-                info(f"    {ip}: {len(compromised_clients[ip])} violations")
+        info(f"Compromised Client Summary: {len(compromised_clients)} total")
     
-    info(f"Total client behavior alerts generated: {alerts}" if alerts > 0 else "No client behavior anomalies detected")
-    return compromised_clients
+    info(f"Total alerts: {alerts}" if alerts > 0 else "No client anomalies detected")
+    return CompromisedClientsReport(compromised_clients)
+
+def check_external_ddos_attacks(servers_data):
+    """
+    SIEM Rule: Detect DDoS attacks from external clients based on high flow rates and periodic timing
+    """
+    alerts = 0
+    info("Running SIEM Rule: External DDoS Attack Detection")
+    
+    # Convert timestamp to seconds for analysis
+    analysis_data = servers_data.copy()
+    analysis_data['timestamp_sec'] = analysis_data['timestamp'] / 100
+    
+    # Analyze each external client
+    for src_ip in analysis_data['src_ip'].unique():
+        client_flows = analysis_data[analysis_data['src_ip'] == src_ip].sort_values('timestamp_sec')
+        
+        if len(client_flows) < 20:  # Need sufficient flows for analysis
+            continue
+            
+        # Calculate timing metrics
+        timestamps = client_flows['timestamp_sec'].values
+        inter_arrival_times = np.diff(timestamps)
+        
+        if len(inter_arrival_times) == 0:
+            continue
+            
+        # Basic metrics
+        total_flows = len(client_flows)
+        time_span = timestamps.max() - timestamps.min()
+        flows_per_second = total_flows / time_span if time_span > 0 else float('inf')
+        
+        # Timing statistics
+        mean_interval = np.mean(inter_arrival_times)
+        std_interval = np.std(inter_arrival_times)
+        cv = std_interval / mean_interval if mean_interval > 0 else float('inf')
+        min_interval = np.min(inter_arrival_times)
+        
+        # Target analysis
+        unique_targets = client_flows['dst_ip'].nunique()
+        
+        # DDoS Detection Rules
+        violations = []
+        
+        # High flow rate detection
+        if flows_per_second >= 10.0:
+            violations.append(f"Very high flow rate: {flows_per_second:.2f} flows/sec")
+        elif flows_per_second >= 5.0:
+            violations.append(f"High flow rate: {flows_per_second:.2f} flows/sec")
+                    
+        # Artificial timing patterns
+        if cv <= 1:
+            violations.append(f"Suspicious periodic timing (CV: {cv:.3f})")
+        
+        # Rapid fire detection (simultaneous requests = bot attack)
+        if min_interval <= 0.001:  # Requests at same timestamp or <1ms apart
+            violations.append(f"Simultaneous requests (automated attack)")
+        elif min_interval < 0.05:
+            violations.append(f"Rapid-fire requests (min interval: {min_interval:.3f}s)")
+        
+        # Volume detection
+        if total_flows >= 1000:
+            violations.append(f"High volume attack: {total_flows} flows")
+        elif total_flows >= 500:
+            violations.append(f"Medium volume attack: {total_flows} flows")
+        
+        # Generate alerts for violators
+        if violations:
+            violation_summary = "; ".join(violations)
+            
+            # Determine severity
+            if (flows_per_second >= 10.0 or cv <= 0.2 or min_interval <= 0.001 or total_flows >= 1000):
+                critical(f"DDoS Attacker {src_ip}: {violation_summary}")
+            else:
+                warning(f"Suspicious External Client {src_ip}: {violation_summary}")
+            
+            alerts += 1
+    
+    # Summary statistics
+    total_clients = analysis_data['src_ip'].nunique()
+    flagged_clients = alerts
+    normal_clients = total_clients - flagged_clients
+    
+    info(f"External Client Summary:")
+    info(f"  Total external clients: {total_clients}")
+    info(f"  Flagged as malicious: {flagged_clients}")
+    info(f"  Normal clients: {normal_clients}")
+    info(f"Total external DDoS alerts: {alerts}" if alerts > 0 else "No external DDoS attacks detected")
